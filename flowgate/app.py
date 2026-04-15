@@ -62,11 +62,25 @@ class FlowGateApp:
         self.root.minsize(1100, 700)
 
         # State
-        self.fcs_data: dict | None = None          # current loaded FCS
-        self.display_data: np.ndarray | None = None # transformed data
+        self.fcs_data: dict | None = None           # current loaded FCS
+        self.display_data: np.ndarray | None = None  # raw data copy
         self.hierarchy = GateHierarchy()
-        self.current_gate_id: str | None = None    # selected gate in tree
-        self.selected_parent_id: str | None = None # parent for new gate
+        self.current_gate_id: str | None = None     # selected gate in tree
+        self.selected_parent_id: str | None = None  # parent for new gate
+
+        # Folder / multi-file state
+        self.folder_path: str | None = None
+        self.fcs_files: list = []                   # list of full paths
+        self.current_file_idx: int = 0
+        # Per-file gate offsets: {filepath: {gate_id: (dx, dy)}}
+        self.file_offsets: dict = {}
+        # Per-file loaded data cache: {filepath: (fcs_data, display_data)}
+        self._fcs_cache: dict = {}
+
+        # Gate drag state
+        self._drag_gate_id: str | None = None
+        self._drag_start: tuple | None = None       # (x, y) in data coords
+        self._drag_origin_offset: tuple = (0.0, 0.0)
 
         self.draw_mode: str = "none"   # "polygon" | "rectangle" | "none"
         self._poly_selector = None
@@ -108,13 +122,14 @@ class FlowGateApp:
         file_menu = tk.Menu(menubar, tearoff=False, bg=BG_PANEL, fg=FG_TEXT,
                             activebackground=ACC_BLUE, activeforeground=BG_DARK)
         menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Open FCS…", command=self.open_fcs, accelerator="Ctrl+O")
+        file_menu.add_command(label="Open FCS Folder…", command=self.open_folder, accelerator="Ctrl+O")
         file_menu.add_separator()
         file_menu.add_command(label="Save Gate Hierarchy…", command=self.save_gates)
         file_menu.add_command(label="Load Gate Hierarchy…", command=self.load_gates)
         file_menu.add_separator()
-        file_menu.add_command(label="Export Gated Population…", command=self.export_gated)
-        file_menu.add_command(label="Export All Gates…", command=self.export_all_gates)
+        file_menu.add_command(label="Export Current File — Selected Gate…", command=self.export_gated)
+        file_menu.add_command(label="Export Current File — All Gates…", command=self.export_all_gates)
+        file_menu.add_command(label="Export All Files — All Gates (Batch)…", command=self.export_batch)
         file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self.root.quit)
 
@@ -127,7 +142,7 @@ class FlowGateApp:
         view_menu.add_command(label="Toggle Light / Dark Mode", command=self.toggle_theme)
         self._view_menu = view_menu
 
-        self.root.bind("<Control-o>", lambda e: self.open_fcs())
+        self.root.bind("<Control-o>", lambda e: self.open_folder())
 
         # ── Outer layout: left panel + plot area ──────────────────
         paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL,
@@ -203,15 +218,46 @@ class FlowGateApp:
                          highlightbackground=sep, highlightcolor=ab)
             return e
 
-        # ── File info ──────────────────────────────────────────────
+        # ── Folder / file browser ─────────────────────────────────
         sec = frame()
         sec.pack(fill=tk.X, padx=10, pady=(12, 4))
-        tk.Label(sec, text="FILE", bg=bp, fg=muted,
+        tk.Label(sec, text="FOLDER", bg=bp, fg=muted,
                  font=("Helvetica", 8)).pack(anchor=tk.W)
-        self.file_label = tk.Label(sec, text="No file loaded", bg=bp, fg=ab,
-                                   font=("Helvetica", 9))
-        self.file_label.pack(anchor=tk.W)
-        self._btn(sec, "Open FCS…", self.open_fcs, width=14).pack(anchor=tk.W, pady=(6, 0))
+        self.folder_label = tk.Label(sec, text="No folder loaded", bg=bp, fg=ab,
+                                     font=("Helvetica", 9), wraplength=220, justify=tk.LEFT)
+        self.folder_label.pack(anchor=tk.W)
+        self._btn(sec, "Open FCS Folder…", self.open_folder, width=18).pack(anchor=tk.W, pady=(6, 0))
+
+        # File list
+        list_frame = tk.Frame(sec, bg=bp)
+        list_frame.pack(fill=tk.X, pady=(6, 0))
+        tk.Label(list_frame, text="FILES", bg=bp, fg=muted,
+                 font=("Helvetica", 8)).pack(anchor=tk.W)
+
+        lb_frame = tk.Frame(list_frame, bg=entry_bg)
+        lb_frame.pack(fill=tk.X)
+        self.file_listbox = tk.Listbox(
+            lb_frame, height=6, bg=entry_bg, fg=fg,
+            selectbackground=ab, selectforeground="#FFFFFF",
+            font=("Helvetica", 8), relief=tk.FLAT, bd=0,
+            highlightthickness=1, highlightbackground=sep,
+            activestyle="none",
+        )
+        lb_scroll = ttk.Scrollbar(lb_frame, orient=tk.VERTICAL,
+                                   command=self.file_listbox.yview)
+        self.file_listbox.configure(yscrollcommand=lb_scroll.set)
+        lb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.file_listbox.pack(fill=tk.X)
+        self.file_listbox.bind("<<ListboxSelect>>", self.on_file_select)
+
+        # Nav buttons
+        nav = tk.Frame(sec, bg=bp)
+        nav.pack(fill=tk.X, pady=(4, 0))
+        self._btn(nav, "◀ Prev", self.prev_file, width=7).pack(side=tk.LEFT, padx=(0, 4))
+        self._btn(nav, "Next ▶", self.next_file, width=7).pack(side=tk.LEFT)
+        self.file_label = tk.Label(nav, text="", bg=bp, fg=muted,
+                                   font=("Helvetica", 8))
+        self.file_label.pack(side=tk.RIGHT)
 
         sep_line()
 
@@ -286,6 +332,25 @@ class FlowGateApp:
                   bg=cancel_bg, fg=cancel_fg, font=("Helvetica", 9, "bold"),
                   relief=tk.FLAT, bd=0, padx=6, pady=4, width=16,
                   cursor="hand2").pack(anchor=tk.W, pady=(4, 0))
+
+        tk.Frame(sec3, bg=sep, height=1).pack(fill=tk.X, pady=(8, 4))
+        tk.Label(sec3, text="PER-FILE ADJUSTMENT", bg=bp, fg=muted,
+                 font=("Helvetica", 8)).pack(anchor=tk.W, pady=(0, 4))
+        self.move_btn = tk.Button(
+            sec3, text="✥  Move Gate (this file)", command=self.start_move_gate,
+            bg=th["ACC_BLUE"], fg="#FFFFFF", font=("Helvetica", 9, "bold"),
+            relief=tk.FLAT, bd=0, padx=6, pady=4, width=22, cursor="hand2")
+        self.move_btn.pack(anchor=tk.W)
+        self.move_label = tk.Label(sec3, text="Select a gate, then drag it",
+                                   bg=bp, fg=muted, font=("Helvetica", 8),
+                                   wraplength=220, justify=tk.LEFT)
+        self.move_label.pack(anchor=tk.W, pady=(2, 0))
+        self._btn(sec3, "↺  Reset Gate Position", self.reset_gate_offset,
+                  color=cancel_bg, width=22).pack(anchor=tk.W, pady=(4, 0))
+        try:
+            self.move_btn.configure(fg=cancel_fg if cancel_bg == "#CCCCCC" else "#FFFFFF")
+        except Exception:
+            pass
 
         sep_line()
 
@@ -387,6 +452,259 @@ class FlowGateApp:
     # ─────────────────────────────────────────────────────────────
     # File I/O
     # ─────────────────────────────────────────────────────────────
+
+    # ─────────────────────────────────────────────────────────────
+    # Folder / multi-file management
+    # ─────────────────────────────────────────────────────────────
+
+    def open_folder(self):
+        """Open a folder of FCS files."""
+        folder = filedialog.askdirectory(title="Open FCS Folder")
+        if not folder:
+            return
+        fcs_files = sorted([
+            os.path.join(folder, f) for f in os.listdir(folder)
+            if f.lower().endswith(".fcs")
+        ])
+        if not fcs_files:
+            messagebox.showinfo("No FCS files", "No .fcs files found in that folder.")
+            return
+        self.folder_path = folder
+        self.fcs_files = fcs_files
+        self.current_file_idx = 0
+        self._fcs_cache = {}
+        self.file_offsets = {}
+        self.hierarchy = GateHierarchy()
+        self.current_gate_id = None
+        self.selected_parent_id = None
+        self._color_cycle = 0
+
+        # Update file listbox
+        self.file_listbox.delete(0, tk.END)
+        for f in fcs_files:
+            self.file_listbox.insert(tk.END, os.path.basename(f))
+        self.file_listbox.selection_set(0)
+
+        folder_name = os.path.basename(folder)
+        self.folder_label.config(text=folder_name)
+        self._load_file_by_idx(0)
+
+    def _load_file_by_idx(self, idx: int):
+        """Load the FCS file at index idx."""
+        if not self.fcs_files or idx < 0 or idx >= len(self.fcs_files):
+            return
+        self.current_file_idx = idx
+        path = self.fcs_files[idx]
+
+        # Use cache if available
+        if path in self._fcs_cache:
+            self.fcs_data, self.display_data = self._fcs_cache[path]
+        else:
+            try:
+                self.fcs_data = read_fcs(path)
+                self.display_data = self.fcs_data["data"].copy().astype(float)
+                self._fcs_cache[path] = (self.fcs_data, self.display_data)
+            except Exception as exc:
+                messagebox.showerror("Error loading FCS", str(exc))
+                return
+
+        # Ensure offset entry exists for this file
+        if path not in self.file_offsets:
+            self.file_offsets[path] = {}
+
+        # Update channel combos
+        chans = self.fcs_data["channels"]
+        self.x_combo["values"] = chans
+        self.y_combo["values"] = chans
+        if self.x_channel and self.x_channel in chans:
+            self.x_combo.set(self.x_channel)
+        elif chans:
+            self.x_combo.current(0)
+            self.x_channel = chans[0]
+        if self.y_channel and self.y_channel in chans:
+            self.y_combo.set(self.y_channel)
+        elif len(chans) > 1:
+            self.y_combo.current(1)
+            self.y_channel = chans[1]
+
+        n = len(self.fcs_data["data"])
+        fname = self.fcs_data["filename"]
+        self.file_label.config(text=f"{idx+1}/{len(self.fcs_files)}")
+        self.event_count_var.set(f"{n:,} events")
+        self.status(f"{fname}  |  {n:,} events  |  {len(chans)} channels")
+
+        # Highlight listbox
+        self.file_listbox.selection_clear(0, tk.END)
+        self.file_listbox.selection_set(idx)
+        self.file_listbox.see(idx)
+
+        self._refresh_gate_tree()
+        self.refresh_plot()
+
+    def on_file_select(self, event):
+        sel = self.file_listbox.curselection()
+        if sel:
+            self._load_file_by_idx(sel[0])
+
+    def prev_file(self):
+        if self.fcs_files:
+            self._load_file_by_idx(max(0, self.current_file_idx - 1))
+
+    def next_file(self):
+        if self.fcs_files:
+            self._load_file_by_idx(min(len(self.fcs_files) - 1,
+                                       self.current_file_idx + 1))
+
+    def _current_offsets(self) -> dict:
+        """Return the offset dict for the current file."""
+        if not self.fcs_files:
+            return {}
+        path = self.fcs_files[self.current_file_idx]
+        return self.file_offsets.get(path, {})
+
+    # ─────────────────────────────────────────────────────────────
+    # Gate drag / move (per-file)
+    # ─────────────────────────────────────────────────────────────
+
+    def start_move_gate(self):
+        """Enable drag mode for the selected gate."""
+        if not self.current_gate_id:
+            messagebox.showinfo("Move Gate",
+                "Select a gate in the hierarchy first, then click Move Gate.")
+            return
+        self._cancel_selectors()
+        self.draw_mode = "move"
+        gate = self.hierarchy.get_gate(self.current_gate_id)
+        self.move_label.config(text=f"Drag '{gate.name}' to reposition for this file")
+        self.status(f"Drag mode: click and drag '{gate.name}' on the plot.")
+        # Connect drag events
+        self._drag_cid_press   = self.canvas.mpl_connect("button_press_event",   self._on_drag_press)
+        self._drag_cid_motion  = self.canvas.mpl_connect("motion_notify_event",  self._on_drag_motion)
+        self._drag_cid_release = self.canvas.mpl_connect("button_release_event", self._on_drag_release)
+
+    def _stop_drag(self):
+        for attr in ("_drag_cid_press", "_drag_cid_motion", "_drag_cid_release"):
+            cid = getattr(self, attr, None)
+            if cid is not None:
+                try:
+                    self.canvas.mpl_disconnect(cid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self._drag_gate_id = None
+        self._drag_start = None
+        self.draw_mode = "none"
+        try:
+            self.move_label.config(text="Select a gate, then drag it")
+        except Exception:
+            pass
+
+    def _on_drag_press(self, event):
+        if event.inaxes != self.ax or not self.current_gate_id:
+            return
+        self._drag_gate_id = self.current_gate_id
+        self._drag_start = (event.xdata, event.ydata)
+        path = self.fcs_files[self.current_file_idx] if self.fcs_files else None
+        if path:
+            ox, oy = self.file_offsets.get(path, {}).get(self._drag_gate_id, (0.0, 0.0))
+            self._drag_origin_offset = (ox, oy)
+
+    def _on_drag_motion(self, event):
+        if event.inaxes != self.ax or not self._drag_gate_id or not self._drag_start:
+            return
+        dx = event.xdata - self._drag_start[0]
+        dy = event.ydata - self._drag_start[1]
+        ox, oy = self._drag_origin_offset
+        path = self.fcs_files[self.current_file_idx] if self.fcs_files else None
+        if path:
+            if path not in self.file_offsets:
+                self.file_offsets[path] = {}
+            self.file_offsets[path][self._drag_gate_id] = (ox + dx, oy + dy)
+        self.refresh_plot()
+
+    def _on_drag_release(self, event):
+        if self._drag_gate_id:
+            path = self.fcs_files[self.current_file_idx] if self.fcs_files else None
+            if path:
+                off = self.file_offsets.get(path, {}).get(self._drag_gate_id, (0, 0))
+                self.status(f"Gate moved — offset ({off[0]:.3f}, {off[1]:.3f}). "
+                            "Click Move Gate again to continue adjusting.")
+            self._refresh_gate_tree()
+        self._stop_drag()
+
+    def reset_gate_offset(self):
+        """Reset the current gate's position for the current file."""
+        if not self.current_gate_id or not self.fcs_files:
+            return
+        path = self.fcs_files[self.current_file_idx]
+        if path in self.file_offsets and self.current_gate_id in self.file_offsets[path]:
+            del self.file_offsets[path][self.current_gate_id]
+        gate = self.hierarchy.get_gate(self.current_gate_id)
+        self.status(f"Gate '{gate.name}' position reset for this file.")
+        self._refresh_gate_tree()
+        self.refresh_plot()
+
+    # ─────────────────────────────────────────────────────────────
+    # Batch export
+    # ─────────────────────────────────────────────────────────────
+
+    def export_batch(self):
+        """Export all gates for all files in the folder."""
+        if not self.fcs_files or not self.hierarchy.gates:
+            messagebox.showinfo("Batch Export", "Open a folder and create gates first.")
+            return
+        out_dir = filedialog.askdirectory(title="Select batch export folder")
+        if not out_dir:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        total_exported = 0
+        errors = []
+        for file_path in self.fcs_files:
+            stem = os.path.splitext(os.path.basename(file_path))[0]
+            # Load data (use cache)
+            if file_path in self._fcs_cache:
+                fcs, raw = self._fcs_cache[file_path]
+            else:
+                try:
+                    fcs = read_fcs(file_path)
+                    raw = fcs["data"].copy().astype(float)
+                    self._fcs_cache[file_path] = (fcs, raw)
+                except Exception as e:
+                    errors.append(f"{os.path.basename(file_path)}: {e}")
+                    continue
+            offsets = self.file_offsets.get(file_path, {})
+            chans = fcs["channels"]
+            # Build display matrix for this file
+            disp = self._build_display_matrix(raw, chans)
+            for gate in self.hierarchy.gates:
+                idxs = self.hierarchy.get_event_indices(gate.id, disp, chans, offsets)
+                raw_gated = fcs["data"][idxs]
+                safe_name = gate.name.replace(" ", "_").replace("/", "-")
+                out_name = f"{stem}_{safe_name}.fcs"
+                out_path = os.path.join(out_dir, out_name)
+                write_fcs(out_path, raw_gated, chans, fcs["metadata"])
+                total_exported += 1
+        msg = f"Batch export complete.\n{total_exported} files exported to:\n{out_dir}"
+        if errors:
+            msg += f"\n\nErrors ({len(errors)}):\n" + "\n".join(errors)
+        messagebox.showinfo("Batch Export", msg)
+        self.status(f"Batch export: {total_exported} files → {out_dir}")
+
+    def _build_display_matrix(self, raw: np.ndarray, chans: list) -> np.ndarray:
+        """Build display matrix applying gate-stored transforms to relevant channels."""
+        mat = raw.copy()
+        ch_settings = {}
+        for gate in self.hierarchy.gates:
+            if gate.x_channel:
+                ch_settings[gate.x_channel] = (gate.x_transform, gate.x_cofactor)
+            if gate.y_channel:
+                ch_settings[gate.y_channel] = (gate.y_transform, gate.y_cofactor)
+        for ch_name, (transform, cofactor) in ch_settings.items():
+            if ch_name in chans:
+                ci = chans.index(ch_name)
+                mat[:, ci] = apply_transform(
+                    mat[:, ci].reshape(-1, 1), transform=transform, cofactor=cofactor).ravel()
+        return mat
 
     def _load_fcs_path(self, path: str):
         """Load an FCS file from a direct path (used by CLI launcher)."""
@@ -492,8 +810,9 @@ class FlowGateApp:
 
     def _do_export(self, gate_id: str, path: str):
         gate = self.hierarchy.get_gate(gate_id)
+        offsets = self._current_offsets()
         idxs = self.hierarchy.get_event_indices(
-            gate_id, self._get_display_matrix(), self.fcs_data["channels"]
+            gate_id, self._get_display_matrix(), self.fcs_data["channels"], offsets
         )
         raw_gated = self.fcs_data["data"][idxs]
         write_fcs(path, raw_gated, self.fcs_data["channels"], self.fcs_data["metadata"])
@@ -547,32 +866,13 @@ class FlowGateApp:
         return x_disp, y_disp
 
     def _get_display_matrix(self):
-        """
-        Build a full n_events x n_channels display matrix where every channel
-        that is referenced by any gate is transformed using that gate's stored
-        transform settings.  This ensures gate masks always evaluate correctly
-        regardless of which axes are currently displayed.
-
-        Channels referenced by multiple gates with different settings use the
-        settings from the most recently created gate on that channel (last-write wins).
-        The current UI axis settings are applied on top for the currently displayed axes.
-        """
+        """Build display matrix for the current file using gate-stored transforms
+        plus the current UI axis settings."""
         if self.fcs_data is None or self.display_data is None:
             return self.display_data
         chans = self.fcs_data["channels"]
-        mat = self.display_data.copy()  # raw values
-
-        # Collect transform settings for every channel used by any gate
-        # Format: {channel_name: (transform, cofactor)}
-        ch_settings = {}
-        for gate in self.hierarchy.gates:
-            if gate.x_channel:
-                ch_settings[gate.x_channel] = (gate.x_transform, gate.x_cofactor)
-            if gate.y_channel:
-                ch_settings[gate.y_channel] = (gate.y_transform, gate.y_cofactor)
-
-        # Also apply the current UI settings for the displayed axes
-        # (covers channels not yet in any gate)
+        mat = self._build_display_matrix(self.display_data, chans)
+        # Also apply current UI axis settings (for channels not yet in any gate)
         x_name = self.x_combo.get()
         y_name = self.y_combo.get()
         try:
@@ -583,19 +883,14 @@ class FlowGateApp:
             y_cf = float(self.y_cofactor_var.get())
         except ValueError:
             y_cf = 150.0
-        if x_name:
-            ch_settings[x_name] = (self.x_transform_var.get(), x_cf)
-        if y_name:
-            ch_settings[y_name] = (self.y_transform_var.get(), y_cf)
-
-        # Apply transforms
-        for ch_name, (transform, cofactor) in ch_settings.items():
-            if ch_name in chans:
-                ci = chans.index(ch_name)
-                mat[:, ci] = apply_transform(
-                    mat[:, ci].reshape(-1, 1),
-                    transform=transform, cofactor=cofactor).ravel()
-
+        if x_name and x_name in chans:
+            ci = chans.index(x_name)
+            mat[:, ci] = apply_transform(mat[:, ci].reshape(-1, 1),
+                transform=self.x_transform_var.get(), cofactor=x_cf).ravel()
+        if y_name and y_name in chans:
+            ci = chans.index(y_name)
+            mat[:, ci] = apply_transform(mat[:, ci].reshape(-1, 1),
+                transform=self.y_transform_var.get(), cofactor=y_cf).ravel()
         return mat
 
     def on_transform_change(self, *_):
@@ -642,9 +937,10 @@ class FlowGateApp:
         disp_mat = self._get_display_matrix()
 
         # Determine which events to show (current gate or all)
+        offsets = self._current_offsets()
         if self.current_gate_id:
             mask = self.hierarchy.compute_mask(
-                self.current_gate_id, disp_mat, chans)
+                self.current_gate_id, disp_mat, chans, offsets)
         else:
             mask = np.ones(len(disp_mat), dtype=bool)
 
@@ -710,36 +1006,47 @@ class FlowGateApp:
         self.canvas.draw_idle()
 
     def _draw_gate_overlay(self, gate: Gate):
+        offsets = self._current_offsets()
+        dx, dy = offsets.get(gate.id, (0.0, 0.0))
+        plot_bg = THEMES[self._theme_name]["BG_PLOT"]
+        # Show a nudge indicator if offset is non-zero
+        has_offset = abs(dx) > 1e-9 or abs(dy) > 1e-9
+        lw = 1.8 if (gate.id == self.current_gate_id) else 1.2
+        alpha_fill = 0.20 if (gate.id == self.current_gate_id) else 0.12
+
         if gate.gate_type == "polygon" and len(gate.vertices) >= 3:
-            verts = gate.vertices + [gate.vertices[0]]
+            shifted = gate.get_offset_vertices(dx, dy)
+            verts = shifted + [shifted[0]]
             xs, ys = zip(*verts)
-            patch = self.ax.fill(xs, ys, alpha=0.15, color=gate.color)[0]
-            line, = self.ax.plot(xs, ys, color=gate.color, lw=1.2, alpha=0.8)
-            cx = np.mean([v[0] for v in gate.vertices])
-            cy = np.mean([v[1] for v in gate.vertices])
-            self.ax.text(cx, cy, gate.name, color=gate.color,
+            patch = self.ax.fill(xs, ys, alpha=alpha_fill, color=gate.color)[0]
+            line, = self.ax.plot(xs, ys, color=gate.color, lw=lw, alpha=0.9,
+                                 linestyle="--" if has_offset else "-")
+            cx = np.mean([v[0] for v in shifted])
+            cy = np.mean([v[1] for v in shifted])
+            label = gate.name + (" ⤢" if has_offset else "")
+            self.ax.text(cx, cy, label, color=gate.color,
                          fontsize=7, ha="center", va="center",
                          bbox=dict(boxstyle="round,pad=0.2",
-                                   fc=THEMES[self._theme_name]["BG_PLOT"],
-                                   ec=gate.color, lw=0.6, alpha=0.9))
+                                   fc=plot_bg, ec=gate.color, lw=0.6, alpha=0.9))
             self._gate_patches[gate.id] = (patch, line)
 
         elif gate.gate_type == "rectangle" and gate.rect_bounds:
-            x0, y0, x1, y1 = gate.rect_bounds
+            x0, y0, x1, y1 = gate.get_offset_rect(dx, dy)
             w, h = abs(x1 - x0), abs(y1 - y0)
             rect = mpatches.FancyBboxPatch(
                 (min(x0, x1), min(y0, y1)), w, h,
-                linewidth=1.2, edgecolor=gate.color,
-                facecolor=gate.color, alpha=0.12,
+                linewidth=lw, edgecolor=gate.color,
+                facecolor=gate.color, alpha=alpha_fill,
                 boxstyle="square,pad=0",
+                linestyle="--" if has_offset else "-",
             )
             self.ax.add_patch(rect)
             cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-            self.ax.text(cx, cy, gate.name, color=gate.color,
+            label = gate.name + (" ⤢" if has_offset else "")
+            self.ax.text(cx, cy, label, color=gate.color,
                          fontsize=7, ha="center", va="center",
                          bbox=dict(boxstyle="round,pad=0.2",
-                                   fc=THEMES[self._theme_name]["BG_PLOT"],
-                                   ec=gate.color, lw=0.6, alpha=0.9))
+                                   fc=plot_bg, ec=gate.color, lw=0.6, alpha=0.9))
             self._gate_patches[gate.id] = rect
 
     # ─────────────────────────────────────────────────────────────
@@ -867,7 +1174,8 @@ class FlowGateApp:
         self.refresh_plot()
 
         stats = self.hierarchy.get_gate_stats(
-            gate.id, self._get_display_matrix(), self.fcs_data["channels"])
+            gate.id, self._get_display_matrix(), self.fcs_data["channels"],
+            self._current_offsets())
         self.status(
             f"Gate '{name}' created  |  {stats['count']:,} events  "
             f"({stats['pct_parent']:.1f}% of parent)"
@@ -884,9 +1192,10 @@ class FlowGateApp:
 
         def insert(parent_id, tree_parent):
             disp = self._get_display_matrix()
+            offsets = self._current_offsets()
             for gate in self.hierarchy.get_children(parent_id):
                 stats = self.hierarchy.get_gate_stats(
-                    gate.id, disp, self.fcs_data["channels"])
+                    gate.id, disp, self.fcs_data["channels"], offsets)
                 count_str = f"{stats['count']:,}"
                 pct_str = f"{stats['pct_parent']:.1f}%"
                 iid = self.gate_tree.insert(

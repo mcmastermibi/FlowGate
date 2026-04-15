@@ -35,18 +35,32 @@ class Gate:
     x_cofactor: float = 150.0
     y_cofactor: float = 150.0
 
-    def apply(self, display_data: np.ndarray, x_idx: int, y_idx: int) -> np.ndarray:
+    def get_offset_vertices(self, dx: float = 0.0, dy: float = 0.0):
+        """Return vertices shifted by (dx, dy)."""
+        return [(x + dx, y + dy) for x, y in self.vertices]
+
+    def get_offset_rect(self, dx: float = 0.0, dy: float = 0.0):
+        """Return rect_bounds shifted by (dx, dy)."""
+        if self.rect_bounds is None:
+            return None
+        x0, y0, x1, y1 = self.rect_bounds
+        return (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+
+    def apply(self, display_data: np.ndarray, x_idx: int, y_idx: int,
+              dx: float = 0.0, dy: float = 0.0) -> np.ndarray:
         """
         Apply gate to display_data (n_events x n_channels, already transformed).
+        dx, dy are per-file translation offsets in display space.
         Returns boolean mask of passing events.
         """
         if self.gate_type == "polygon" and len(self.vertices) >= 3:
             pts = display_data[:, [x_idx, y_idx]]
-            path = Path(self.vertices)
+            shifted = self.get_offset_vertices(dx, dy)
+            path = Path(shifted)
             return path.contains_points(pts)
 
         elif self.gate_type == "rectangle" and self.rect_bounds is not None:
-            x0, y0, x1, y1 = self.rect_bounds
+            x0, y0, x1, y1 = self.get_offset_rect(dx, dy)
             xmin, xmax = min(x0, x1), max(x0, x1)
             ymin, ymax = min(y0, y1), max(y0, y1)
             xvals = display_data[:, x_idx]
@@ -127,8 +141,11 @@ class GateHierarchy:
         gate_id: str,
         display_data: np.ndarray,
         channel_names: List[str],
+        offsets: Optional[dict] = None,
     ) -> np.ndarray:
-        """Recursively compute the boolean event mask for a gate."""
+        """Recursively compute the boolean event mask for a gate.
+        offsets: {gate_id: (dx, dy)} per-file translation offsets.
+        """
         gate = self.get_gate(gate_id)
         if gate is None:
             return np.ones(len(display_data), dtype=bool)
@@ -137,7 +154,8 @@ class GateHierarchy:
         if gate.parent_id is None:
             parent_mask = np.ones(len(display_data), dtype=bool)
         else:
-            parent_mask = self.compute_mask(gate.parent_id, display_data, channel_names)
+            parent_mask = self.compute_mask(gate.parent_id, display_data,
+                                            channel_names, offsets)
 
         # Map channel names to indices
         try:
@@ -146,7 +164,8 @@ class GateHierarchy:
         except ValueError:
             return parent_mask
 
-        own_mask = gate.apply(display_data, x_idx, y_idx)
+        dx, dy = (offsets or {}).get(gate_id, (0.0, 0.0))
+        own_mask = gate.apply(display_data, x_idx, y_idx, dx=dx, dy=dy)
         return parent_mask & own_mask
 
     def get_gate_stats(
@@ -154,18 +173,20 @@ class GateHierarchy:
         gate_id: str,
         display_data: np.ndarray,
         channel_names: List[str],
+        offsets: Optional[dict] = None,
     ) -> dict:
         """Return count and % of parent for a gate."""
         gate = self.get_gate(gate_id)
         total = len(display_data)
 
-        own_mask = self.compute_mask(gate_id, display_data, channel_names)
+        own_mask = self.compute_mask(gate_id, display_data, channel_names, offsets)
         count = own_mask.sum()
 
         if gate.parent_id is None:
             parent_count = total
         else:
-            parent_mask = self.compute_mask(gate.parent_id, display_data, channel_names)
+            parent_mask = self.compute_mask(gate.parent_id, display_data,
+                                            channel_names, offsets)
             parent_count = parent_mask.sum()
 
         pct_parent = (count / parent_count * 100) if parent_count > 0 else 0
@@ -184,9 +205,10 @@ class GateHierarchy:
         gate_id: str,
         display_data: np.ndarray,
         channel_names: List[str],
+        offsets: Optional[dict] = None,
     ) -> np.ndarray:
         """Return indices of events passing a gate (for export)."""
-        mask = self.compute_mask(gate_id, display_data, channel_names)
+        mask = self.compute_mask(gate_id, display_data, channel_names, offsets)
         return np.where(mask)[0]
 
     def save(self, filepath: str):
