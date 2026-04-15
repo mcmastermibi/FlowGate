@@ -1,4 +1,4 @@
-# FlowGate 🔬
+## FlowGate 🔬
 
 **Open-source manual FCS gating — a Python alternative to FlowJo / FCS Express / OMIQ**
 
@@ -52,15 +52,12 @@ flowgate
 python -m flowgate.app
 ```
 
-### Generating a demo FCS file
+### Demo FCS files
 
-```bash
-cd examples
-python generate_demo_fcs.py demo_PBMC.fcs
-```
-
-This creates a 30,000-event synthetic PBMC file with channels:
+A set of demo FCS files is included in the `examples/FCS/` folder. Each file contains 30,000-event synthetic PBMC data with channels:
 `FSC-A`, `SSC-A`, `Live_Dead_Aqua`, `CD45`, `CD3`, `CD19`, `CD56`, `CD14`, `HLA-DR`
+
+To load the demo data, use `File > Open FCS Folder…` and navigate to `examples/FCS/`.
 
 ---
 
@@ -77,7 +74,7 @@ All Events
 
 **Step-by-step in the GUI:**
 
-1. **Open FCS** → `File > Open FCS…` or `Ctrl+O`
+1. **Open FCS folder** → `File > Open FCS Folder…` or `Ctrl+O`, then select a folder containing `.fcs` files
 2. **Set axes** → Select X and Y channels from the dropdowns
 3. **Set transform** → `asinh` with cofactor `150` is good for most instruments
 4. **Draw gate** → Click `✏ Polygon` or `▭ Rectangle`, draw on the plot
@@ -169,7 +166,7 @@ print(f"{len(idxs):,} events in CD3+ gate")
 
 | Key | Action |
 |---|---|
-| `Ctrl+O` | Open FCS file |
+| `Ctrl+O` | Open FCS folder |
 | `Enter` | Close polygon gate |
 | `Escape` | Cancel current polygon |
 | `Delete` | Delete selected gate |
