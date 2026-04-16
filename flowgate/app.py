@@ -52,6 +52,24 @@ ACC_RED   = THEMES["dark"]["ACC_RED"]
 SEP_COLOR = THEMES["dark"]["SEP_COLOR"]
 
 
+
+
+def _make_button(parent, text, command, bg, fg, font=("Helvetica", 9, "bold"),
+                 relief=tk.FLAT, bd=0, padx=6, pady=4, width=16, cursor="hand2"):
+    """
+    macOS-safe coloured button.
+    On macOS, tk.Button ignores bg/fg after ttk theme changes.
+    Setting highlightbackground forces the colour to render.
+    """
+    btn = tk.Button(
+        parent, text=text, command=command,
+        bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+        font=font, relief=relief, bd=bd, padx=padx, pady=pady,
+        width=width, cursor=cursor,
+        highlightthickness=0, highlightbackground=bg,
+    )
+    return btn
+
 class FlowGateApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -179,15 +197,12 @@ class FlowGateApp:
 
     def _btn(self, parent, text, cmd, color=None, width=16) -> tk.Button:
         t = self._t()
-        bg = color if color is not None else t["ACC_BLUE"]
-        # Determine foreground: white on dark/saturated buttons, dark on light buttons
-        fg = "#FFFFFF" if bg in (t["ACC_BLUE"], t["ACC_GREEN"], t["ACC_RED"]) else t["FG_TEXT"]
-        return tk.Button(
-            parent, text=text, command=cmd,
-            bg=bg, fg=fg, activebackground=t["FG_TEXT"],
-            font=("Helvetica", 9, "bold"), relief=tk.FLAT,
-            bd=0, padx=6, pady=4, width=width, cursor="hand2",
-        )
+        btn_bg = "#444455" if self._theme_name == "dark" else "#CCCCCC"
+        bg = color if color is not None else btn_bg
+        # Light text on dark/saturated buttons, dark text on light-grey buttons
+        fg = "#333333"  # dark text on all neutral grey buttons
+        return _make_button(parent, text=text, command=cmd,
+                            bg=bg, fg=fg, width=width)
 
     def _build_left_panel(self, parent):
         th = self._t()   # current theme dict — read fresh each build
@@ -330,18 +345,17 @@ class FlowGateApp:
 
         cancel_bg = "#CCCCCC" if self._theme_name == "light" else "#444455"
         cancel_fg = "#333333"  # always dark text — these buttons have light backgrounds
-        tk.Button(sec3, text="✕  Cancel Draw", command=self.cancel_draw,
-                  bg=cancel_bg, fg=cancel_fg, font=("Helvetica", 9, "bold"),
-                  relief=tk.FLAT, bd=0, padx=6, pady=4, width=16,
-                  cursor="hand2").pack(anchor=tk.W, pady=(4, 0))
+        _make_button(sec3, text="✕  Cancel Draw", command=self.cancel_draw,
+                     bg=cancel_bg, fg=cancel_fg, width=16).pack(anchor=tk.W, pady=(4, 0))
 
         tk.Frame(sec3, bg=sep, height=1).pack(fill=tk.X, pady=(8, 4))
         tk.Label(sec3, text="PER-FILE ADJUSTMENT", bg=bp, fg=muted,
                  font=("Helvetica", 8)).pack(anchor=tk.W, pady=(0, 4))
-        self.move_btn = tk.Button(
+        move_bg = "#444455" if self._theme_name == "dark" else "#CCCCCC"
+        move_fg = "#333333"
+        self.move_btn = _make_button(
             sec3, text="✥  Move Gate (this file)", command=self.start_move_gate,
-            bg=th["ACC_BLUE"], fg="#FFFFFF", font=("Helvetica", 9, "bold"),
-            relief=tk.FLAT, bd=0, padx=6, pady=4, width=22, cursor="hand2")
+            bg=move_bg, fg=move_fg, width=22)
         self.move_btn.pack(anchor=tk.W)
         self.move_label = tk.Label(sec3, text="Select a gate, then drag it",
                                    bg=bp, fg=muted, font=("Helvetica", 8),
@@ -349,10 +363,7 @@ class FlowGateApp:
         self.move_label.pack(anchor=tk.W, pady=(2, 0))
         self._btn(sec3, "↺  Reset Gate Position", self.reset_gate_offset,
                   color=cancel_bg, width=22).pack(anchor=tk.W, pady=(4, 0))
-        try:
-            self.move_btn.configure(fg=cancel_fg if cancel_bg == "#CCCCCC" else "#FFFFFF")
-        except Exception:
-            pass
+        # move_btn fg already set correctly above
 
         sep_line()
 
@@ -406,10 +417,8 @@ class FlowGateApp:
                   color=ag, width=9).pack(side=tk.LEFT, padx=(0, 4))
         rename_bg = "#CCCCCC" if self._theme_name == "light" else "#555566"
         rename_fg = "#333333"  # always dark text — these buttons have light backgrounds
-        tk.Button(gbtn, text="✎ Rename", command=self.rename_gate,
-                  bg=rename_bg, fg=rename_fg, font=("Helvetica", 9, "bold"),
-                  relief=tk.FLAT, bd=0, padx=6, pady=4, width=9,
-                  cursor="hand2").pack(side=tk.LEFT, padx=(0, 4))
+        _make_button(gbtn, text="✎ Rename", command=self.rename_gate,
+                     bg=rename_bg, fg=rename_fg, width=9).pack(side=tk.LEFT, padx=(0, 4))
         self._btn(gbtn, "✕ Delete", self.delete_selected_gate,
                   color=th["ACC_RED"], width=9).pack(side=tk.LEFT)
 
@@ -863,12 +872,21 @@ class FlowGateApp:
 
     def _get_display_matrix(self):
         """Build display matrix for the current file using gate-stored transforms
-        plus the current UI axis settings."""
+        plus the current UI axis settings for any channels not already covered."""
         if self.fcs_data is None or self.display_data is None:
             return self.display_data
         chans = self.fcs_data["channels"]
         mat = self._build_display_matrix(self.display_data, chans)
-        # Also apply current UI axis settings (for channels not yet in any gate)
+
+        # Collect channels already transformed by _build_display_matrix
+        already_transformed = set()
+        for gate in self.hierarchy.gates:
+            if gate.x_channel:
+                already_transformed.add(gate.x_channel)
+            if gate.y_channel:
+                already_transformed.add(gate.y_channel)
+
+        # Only apply current UI transform to channels NOT already handled above
         x_name = self.x_combo.get()
         y_name = self.y_combo.get()
         try:
@@ -879,11 +897,11 @@ class FlowGateApp:
             y_cf = float(self.y_cofactor_var.get())
         except ValueError:
             y_cf = 150.0
-        if x_name and x_name in chans:
+        if x_name and x_name in chans and x_name not in already_transformed:
             ci = chans.index(x_name)
             mat[:, ci] = apply_transform(mat[:, ci].reshape(-1, 1),
                 transform=self.x_transform_var.get(), cofactor=x_cf).ravel()
-        if y_name and y_name in chans:
+        if y_name and y_name in chans and y_name not in already_transformed:
             ci = chans.index(y_name)
             mat[:, ci] = apply_transform(mat[:, ci].reshape(-1, 1),
                 transform=self.y_transform_var.get(), cofactor=y_cf).ravel()
@@ -1111,8 +1129,9 @@ class FlowGateApp:
             except Exception:
                 pass
             self._rect_selector = None
-        self.poly_btn.config(bg=ACC_BLUE)
-        self.rect_btn.config(bg=ACC_BLUE)
+        neutral = "#444455" if self._theme_name == "dark" else "#CCCCCC"
+        self.poly_btn.config(bg=neutral)
+        self.rect_btn.config(bg=neutral)
 
     def _on_polygon_complete(self, verts):
         self._cancel_selectors()
