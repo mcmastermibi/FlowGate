@@ -42,21 +42,21 @@ THEMES = {
 }
 
 # Module-level colour variables — mutated by set_theme()
-BG_DARK   = THEMES["light"]["BG_DARK"]
-BG_PANEL  = THEMES["light"]["BG_PANEL"]
-BG_PLOT   = THEMES["light"]["BG_PLOT"]
-FG_TEXT   = THEMES["light"]["FG_TEXT"]
-ACC_BLUE  = THEMES["light"]["ACC_BLUE"]
-ACC_GREEN = THEMES["light"]["ACC_GREEN"]
-ACC_RED   = THEMES["light"]["ACC_RED"]
-SEP_COLOR = THEMES["light"]["SEP_COLOR"]
+BG_DARK   = THEMES["dark"]["BG_DARK"]
+BG_PANEL  = THEMES["dark"]["BG_PANEL"]
+BG_PLOT   = THEMES["dark"]["BG_PLOT"]
+FG_TEXT   = THEMES["dark"]["FG_TEXT"]
+ACC_BLUE  = THEMES["dark"]["ACC_BLUE"]
+ACC_GREEN = THEMES["dark"]["ACC_GREEN"]
+ACC_RED   = THEMES["dark"]["ACC_RED"]
+SEP_COLOR = THEMES["dark"]["SEP_COLOR"]
 
 
 class FlowGateApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("FlowGate — Manual FCS Gating")
-        self._theme_name = "light"
+        self._theme_name = "dark"
         self.root.configure(bg=BG_DARK)
         self.root.geometry("1400x900")
         self.root.minsize(1100, 700)
@@ -122,6 +122,7 @@ class FlowGateApp:
         file_menu = tk.Menu(menubar, tearoff=False, bg=BG_PANEL, fg=FG_TEXT,
                             activebackground=ACC_BLUE, activeforeground=BG_DARK)
         menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Open FCS File…", command=self.open_fcs, accelerator="Ctrl+Shift+O")
         file_menu.add_command(label="Open FCS Folder…", command=self.open_folder, accelerator="Ctrl+O")
         file_menu.add_separator()
         file_menu.add_command(label="Save Gate Hierarchy…", command=self.save_gates)
@@ -143,6 +144,7 @@ class FlowGateApp:
         self._view_menu = view_menu
 
         self.root.bind("<Control-o>", lambda e: self.open_folder())
+        self.root.bind("<Control-O>", lambda e: self.open_fcs())
 
         # ── Outer layout: left panel + plot area ──────────────────
         paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL,
@@ -327,7 +329,7 @@ class FlowGateApp:
         self.rect_btn.pack(side=tk.LEFT)
 
         cancel_bg = "#CCCCCC" if self._theme_name == "light" else "#444455"
-        cancel_fg = "#333333" if self._theme_name == "light" else fg
+        cancel_fg = "#333333"  # always dark text — these buttons have light backgrounds
         tk.Button(sec3, text="✕  Cancel Draw", command=self.cancel_draw,
                   bg=cancel_bg, fg=cancel_fg, font=("Helvetica", 9, "bold"),
                   relief=tk.FLAT, bd=0, padx=6, pady=4, width=16,
@@ -403,7 +405,7 @@ class FlowGateApp:
         self._btn(gbtn, "⊕ Gate In", self.gate_into_selected,
                   color=ag, width=9).pack(side=tk.LEFT, padx=(0, 4))
         rename_bg = "#CCCCCC" if self._theme_name == "light" else "#555566"
-        rename_fg = "#333333" if self._theme_name == "light" else fg
+        rename_fg = "#333333"  # always dark text — these buttons have light backgrounds
         tk.Button(gbtn, text="✎ Rename", command=self.rename_gate,
                   bg=rename_bg, fg=rename_fg, font=("Helvetica", 9, "bold"),
                   relief=tk.FLAT, bd=0, padx=6, pady=4, width=9,
@@ -734,28 +736,22 @@ class FlowGateApp:
         )
         if not path:
             return
-        try:
-            self.status("Loading FCS…")
-            self.fcs_data = read_fcs(path)
-            self._compute_display_data()
-            self.file_label.config(text=self.fcs_data["filename"])
+        # Treat as a single-file folder so the file list and nav work consistently
+        self.folder_path = os.path.dirname(path)
+        self.fcs_files = [path]
+        self.current_file_idx = 0
+        self._fcs_cache = {}
+        self.file_offsets = {}
+        self.hierarchy = GateHierarchy()
+        self.current_gate_id = None
+        self.selected_parent_id = None
+        self._color_cycle = 0
 
-            chans = self.fcs_data["channels"]
-            self.x_combo["values"] = chans
-            self.y_combo["values"] = chans
-            # Sensible defaults
-            self.x_combo.current(min(0, len(chans) - 1))
-            self.y_combo.current(min(1, len(chans) - 1))
-
-            self.hierarchy = GateHierarchy()
-            self._refresh_gate_tree()
-
-            n = len(self.fcs_data["data"])
-            self.event_count_var.set(f"{n:,} events loaded")
-            self.status(f"Loaded: {self.fcs_data['filename']}  |  {n:,} events  |  {len(chans)} channels")
-            self.refresh_plot()
-        except Exception as exc:
-            messagebox.showerror("Error loading FCS", str(exc))
+        self.file_listbox.delete(0, tk.END)
+        self.file_listbox.insert(tk.END, os.path.basename(path))
+        self.file_listbox.selection_set(0)
+        self.folder_label.config(text=os.path.basename(self.folder_path))
+        self._load_file_by_idx(0)
 
     def save_gates(self):
         if not self.hierarchy.gates:
